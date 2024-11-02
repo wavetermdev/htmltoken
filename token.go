@@ -6,6 +6,7 @@
 // and modified to be used in the vdom package
 // we are producing a JSX-like parser, which requires us to have case sensitivity for attributes and tags
 // the sole changes in this package are to remove the lower() calls.
+// modifications are marked with a comment starting with "MOD"
 
 package htmltoken
 
@@ -72,6 +73,7 @@ func (t TokenType) String() string {
 // Namespace is only used by the parser, not the tokenizer.
 type Attribute struct {
 	Namespace, Key, Val string
+	IsJson              bool // MOD - added to support json attributes
 }
 
 // A Token consists of a TokenType and some Data (tag name for start and end
@@ -297,9 +299,11 @@ type Tokenizer struct {
 	// pendingAttr is the attribute key and value currently being tokenized.
 	// When complete, pendingAttr is pushed onto attr. nAttrReturned is
 	// incremented on each call to TagAttr.
-	pendingAttr   [2]span
-	attr          [][2]span
-	nAttrReturned int
+	pendingAttr       [2]span
+	pendingAttrIsJson bool // MOD - added to support json attributes
+	attr              [][2]span
+	jsonAttr          []bool // MOD - added to support json attributes (made parallel to reduce code changes)
+	nAttrReturned     int
 	// rawTag is the "script" in "</script>" that closes the next token. If
 	// non-empty, the subsequent call to Next will return a raw or RCDATA text
 	// token: one that treats "<p>" as text instead of an element.
@@ -995,6 +999,7 @@ func (z *Tokenizer) readStartTag() TokenType {
 // in [A-Za-z].
 func (z *Tokenizer) readTag(saveAttr bool) {
 	z.attr = z.attr[:0]
+	z.jsonAttr = z.jsonAttr[:0]
 	z.nAttrReturned = 0
 	// Read the tag name and attribute key/value pairs.
 	z.readTagName()
@@ -1006,12 +1011,14 @@ func (z *Tokenizer) readTag(saveAttr bool) {
 		if z.err != nil || c == '>' {
 			break
 		}
+		z.pendingAttrIsJson = false
 		z.raw.end--
 		z.readTagAttrKey()
 		z.readTagAttrVal()
 		// Save pendingAttr if saveAttr and that attribute has a non-empty key.
 		if saveAttr && z.pendingAttr[0].start != z.pendingAttr[0].end {
 			z.attr = append(z.attr, z.pendingAttr)
+			z.jsonAttr = append(z.jsonAttr, z.pendingAttrIsJson)
 		}
 		if z.skipWhiteSpace(); z.err != nil {
 			break
@@ -1115,6 +1122,12 @@ func (z *Tokenizer) readTagAttrVal() {
 				return
 			}
 		}
+
+	case '{':
+		// MOD -- added support for brace-enclosed JSON attributes
+		z.pendingAttrIsJson = true
+		z.parseBraceAttr()
+		return
 
 	default:
 		z.pendingAttr[1].start = z.raw.end - 1
@@ -1345,20 +1358,22 @@ func (z *Tokenizer) TagName() (name []byte, hasAttr bool) {
 // TagAttr returns the lower-cased key and unescaped value of the next unparsed
 // attribute for the current tag token and whether there are more attributes.
 // The contents of the returned slices may change on the next call to Next.
-func (z *Tokenizer) TagAttr() (key, val []byte, moreAttr bool) {
+// MOD -- added isJson bool return value
+func (z *Tokenizer) TagAttr() (key, val []byte, isJson bool, moreAttr bool) {
 	if z.nAttrReturned < len(z.attr) {
 		switch z.tt {
 		case StartTagToken, SelfClosingTagToken:
 			x := z.attr[z.nAttrReturned]
+			isJson := z.jsonAttr[z.nAttrReturned]
 			z.nAttrReturned++
 			key = z.buf[x[0].start:x[0].end]
 			val = z.buf[x[1].start:x[1].end]
 			// MOD -- remove lower(s)
-			return key, unescape(convertNewlines(val), true), z.nAttrReturned < len(z.attr)
+			return key, unescape(convertNewlines(val), true), isJson, z.nAttrReturned < len(z.attr)
 			// return lower(key), unescape(convertNewlines(val), true), z.nAttrReturned < len(z.attr)
 		}
 	}
-	return nil, nil, false
+	return nil, nil, false, false
 }
 
 // Token returns the current Token. The result's Data and Attr values remain
@@ -1372,8 +1387,10 @@ func (z *Tokenizer) Token() Token {
 		name, moreAttr := z.TagName()
 		for moreAttr {
 			var key, val []byte
-			key, val, moreAttr = z.TagAttr()
-			t.Attr = append(t.Attr, Attribute{"", atom.String(key), string(val)})
+			var isJson bool
+			// MOD -- added isJson
+			key, val, isJson, moreAttr = z.TagAttr()
+			t.Attr = append(t.Attr, Attribute{"", atom.String(key), string(val), isJson})
 		}
 		if a := atom.Lookup(name); a != 0 {
 			t.DataAtom, t.Data = a, a.String()
